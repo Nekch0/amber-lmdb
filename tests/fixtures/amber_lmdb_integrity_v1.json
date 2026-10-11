@@ -1,0 +1,8 @@
+{
+  "format": "amber-lmdb-v1\n",
+  "domain_hex": "544c4d4901",
+  "location_hex": "4d4d464b01000000000100000000000000076d65737361676500",
+  "writer_tag": "write_str",
+  "value_hex": "e697a5e69cace8aa9e",
+  "metadata_hex": "544c4d490109000000000000000977726974655f7374727874d0f3795bb913c8ca40f3ced848cfacef1180a0af6ba5a02125cd8da0bd20"
+}

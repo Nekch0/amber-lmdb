@@ -1,0 +1,63 @@
+[project]
+name = "amber-lmdb"
+version = "0.1.0"
+description = "Typed LMDB values, atomic generation publication, and bounded store inspection"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Nekch0", email = "ptdmc.akdmc@gmail.com" }]
+requires-python = ">=3.12"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
+dependencies = [
+    "lmdb>=3.0.0,<4.0.0",
+    "numpy>=2.4.6",
+    "msgpack>=1.2.1",
+    "frozendict>=2.4.7",
+]
+
+[project.optional-dependencies]
+torch = ["torch>=2.12.1"]
+dtypes = ["ml-dtypes>=0.5.4"]
+
+[project.urls]
+Homepage = "https://github.com/Nekch0/amber-lmdb"
+Documentation = "https://github.com/Nekch0/amber-lmdb/tree/main/guides"
+Repository = "https://github.com/Nekch0/amber-lmdb"
+Issues = "https://github.com/Nekch0/amber-lmdb/issues"
+
+[project.scripts]
+amber-lmdb = "amber_lmdb.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.21,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+source-include = ["guides/**", "tests/**", "benchmarks/**", "CONTRIBUTING.md"]
+
+[dependency-groups]
+dev = ["pytest>=9.1.0", "ruff>=0.15.21", "pyright>=1.1.405"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+include = ["src/amber_lmdb"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "PERF", "RUF", "SIM", "UP"]
+allowed-confusables = ["ノ", "（", "）", "，"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["E402"]
