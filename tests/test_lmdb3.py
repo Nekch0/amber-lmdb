@@ -44,7 +44,13 @@ def test_native_engine_roundtrip_and_all_inspection_paths(tmp_path, engine, caps
     assert json.loads(capsys.readouterr().out)["ok"]
     assert main(["inspect", str(path)]) == 0
     assert json.loads(capsys.readouterr().out)["lib_version"][0] == engine
+    with open_environment(path, readonly=False) as handle:
+        assert not handle.environment.flags()["readonly"]
     assert not get_active_envs()
+    # py-lmdb creates missing directories through narrow Windows calls that misread
+    # non-ASCII paths unless the system code page is UTF-8 (a stray directory or
+    # FileNotFoundError); amber-lmdb opens only directories it created itself.
+    assert [entry.name for entry in tmp_path.iterdir()] == ["日本語"]
 
 
 def test_default_engine_is_explicit_and_ignores_process_default(tmp_path, monkeypatch):

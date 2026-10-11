@@ -671,10 +671,14 @@ class LMDBWriter:
         if self._env is None:
             if self._tmp_path is None:
                 raise RuntimeError("LMDBWriter must be entered before writing")
+            # The staging directory already exists. py-lmdb's create=True probes and
+            # makes directories through narrow Windows calls that misread non-ASCII
+            # paths unless the system code page is UTF-8; LMDB itself opens UTF-16.
             env = lmdb.open(
                 str(self._tmp_path),
                 map_size=self._map_size,
                 subdir=True,
+                create=False,
                 lock=True,
                 readahead=False,
                 meminit=False,
@@ -1542,6 +1546,7 @@ def _open_env(
         max_readers=max_readers,
         map_size=map_size,
         subdir=True,
+        create=False,  # see LMDBWriter._get_env: never let py-lmdb make directories
         max_dbs=1,
         max_spare_txns=0,
         lib_version=engine,
