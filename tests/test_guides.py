@@ -16,6 +16,7 @@ import pytest
         "bounded-values-and-schemas.md",
         "combining-and-tracking-stores.md",
         "pytorch.md",
+        "command-line-views.md",
     ],
 )
 def test_guide_examples(name):

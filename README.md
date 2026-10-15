@@ -13,8 +13,9 @@ pip install amber-lmdb
 amber-lmdb --help
 ```
 
-The base installation depends on LMDB, NumPy, MessagePack and frozendict. It does
-not install or import PyTorch. Install `amber-lmdb[torch]` for tensor conversion
+The base installation depends on LMDB, NumPy, MessagePack and frozendict, plus
+Rich, Textual and pyperclip for the human-oriented views; the storage API never
+imports the latter three. It does not install or import PyTorch. Install `amber-lmdb[torch]` for tensor conversion
 and `amber-lmdb[dtypes]` for NumPy extension dtypes that require ml-dtypes.
 
 ## Concepts
@@ -178,10 +179,12 @@ amber-lmdb delete-generations ./example.lmdb --keep-last 2   # preview
 amber-lmdb fingerprint ./example.lmdb --generation v-<32 hex>
 amber-lmdb diff ./example.lmdb ./example.lmdb --before-generation v-<32 hex>
 amber-lmdb manifest ./example.lmdb
+amber-lmdb show ./example.lmdb                   # rich text for people
+amber-lmdb browse ./stores                       # interactive explorer
 python -m amber_lmdb --version
 ```
 
-Every command prints one JSON document. Exit codes: 0 success; 1 the command ran
+Every command except `show` and `browse` prints one JSON document. Exit codes: 0 success; 1 the command ran
 and found something (problems, differences, refused deletions, busy cache entries);
 2 invalid usage; 3 the command could not complete (missing or unreadable store,
 invalid layout, I/O error), with `{"error": {"type", "message"}}` on stdout and the
@@ -196,6 +199,11 @@ decoded keys), never the number of checked entries. Pass the previous `next_afte
 token to `inspect --after` for another page; each call opens a fresh transaction.
 Metadata with non-string dictionary keys is shown as a `mapping` list of pairs;
 arrays are summarized by type, shape and dtype. The CLI never runs custom decoders.
+
+`show` and `browse` are the human-oriented views of `amber_lmdb.ui`, which packages
+built on amber-lmdb customize (store profiles, Japanese text, a dataset browser and a
+ready-made `doctor`/`dataset`/`paths`/`features` command line); see
+[Command-line views and explorers](guides/command-line-views.md).
 
 The same inspection is available in Python:
 

@@ -1,7 +1,7 @@
 [project]
 name = "amber-lmdb"
-version = "0.1.0"
-description = "Typed LMDB values, atomic generation publication, and bounded store inspection"
+version = "0.1.1"
+description = "Typed LMDB values, atomic generation publication, bounded store inspection and store explorers"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -19,6 +19,10 @@ dependencies = [
     "numpy>=2.4.6",
     "msgpack>=1.2.1",
     "frozendict>=2.4.7",
+    "rich>=14.0",
+    "textual>=8.2",
+    "pyperclip>=1.8",
+    "rich-argparse>=1.7",
 ]
 
 [project.optional-dependencies]

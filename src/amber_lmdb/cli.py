@@ -1,6 +1,7 @@
 """Command-line inspection, validation, generation management and cache cleanup.
 
-Every command prints one JSON document on stdout. Exit codes: 0 success; 1 the
+Every command prints one JSON document on stdout, except ``show`` (rich text for
+people) and ``browse`` (an interactive explorer). Exit codes: 0 success; 1 the
 command ran and found something (problems, differences, refused deletions, busy
 cache entries); 2 invalid usage; 3 the command could not complete (missing or
 unreadable store, invalid layout, I/O failure), with ``{"error": ...}`` on stdout
@@ -403,6 +404,21 @@ def build_parser() -> argparse.ArgumentParser:
     listing.add_argument("directory", type=Path, help="Directory holding dataset roots.")
     listing.add_argument("--name", default=None, help="Only names containing this text.")
 
+    show = commands.add_parser(
+        "show",
+        help="Print a store for people: file, metadata summary, features and usage (not JSON).",
+    )
+    show.add_argument("path", type=Path, help="Dataset root.")
+    show.add_argument(
+        "--no-entries", action="store_true", help="Do not count entries; only read metadata."
+    )
+
+    browse = commands.add_parser(
+        "browse",
+        help="Open the interactive explorer on a directory of *.lmdb stores (needs a terminal).",
+    )
+    browse.add_argument("directory", type=Path, help="Directory holding dataset roots.")
+
     for command in ("cache-list", "cache-prune"):
         cache = commands.add_parser(
             command,
@@ -487,6 +503,38 @@ def _is_store(path: Path) -> bool:
         return False
 
 
+def _show(path: Path, *, with_entries: bool) -> int:
+    """Print one store with rich formatting; exit 1 when its metadata is unreadable."""
+    from rich.padding import Padding
+
+    from .ui.render import new_console, print_section
+    from .ui.stores import StoreProfile, describe_store
+    from .ui.views import feature_section, store_grid
+
+    if not path.is_dir():
+        raise FileNotFoundError(f"store not found: {path}")
+    console = new_console()
+    profile = StoreProfile()
+    summary = describe_store(path, with_entries=with_entries, with_meta=True)
+    print_section(console, summary.name, store_grid(summary, profile, expand=False))
+    if summary.meta is not None:
+        console.print(Padding(feature_section(summary, profile, console), (0, 0, 0, 2)))
+    return EXIT_OK if summary.meta_error is None else EXIT_FINDINGS
+
+
+def _browse(directory: Path) -> int:
+    from .ui.render import is_interactive
+
+    if not directory.is_dir():
+        raise FileNotFoundError(f"directory not found: {directory}")
+    if not is_interactive():
+        raise ValueError("browse needs an interactive terminal; use list or show instead")
+    from .ui.tui.stores import StoreExplorerApp
+
+    StoreExplorerApp(directory).run()
+    return EXIT_OK
+
+
 def _run(args: argparse.Namespace) -> int:
     reading: dict[str, Any] = {}
     if "read_only_media" in args:
@@ -494,6 +542,10 @@ def _run(args: argparse.Namespace) -> int:
     if getattr(args, "generation", None) is not None:
         reading["generation"] = args.generation
     command = args.command
+    if command == "show":
+        return _show(args.path, with_entries=not args.no_entries)
+    if command == "browse":
+        return _browse(args.directory)
     if command == "cache-list":
         entries = []
         for cache in _caches(args):
