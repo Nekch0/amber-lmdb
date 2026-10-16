@@ -112,6 +112,14 @@ take up to 1024 keys by default; raise `max_items` (up to 2**20) and `max_bytes`
 - Keep `verify_threads=0` (the default) in worker readers; workers already use the
   cores. Verifying digests can be skipped with `verify_checksums=False` only for
   stores whose operator vouches that they are intact.
+- On network storage (NFS) a cold read waits for every page in turn. Read a batch
+  with `read_as_ndarray_many` or `read_as_tensor_many` and give the reader
+  `read_threads=8` (or more): the bodies are fetched concurrently before they are
+  copied. On a 1 GbE NFS mount, reading 26 values of about 155 KB at a time rose
+  from 14 MB/s to 54 MB/s with eight threads and 74 MB/s with 26; four processes
+  together rose from 50 MB/s to 82 MB/s. The threads wait on I/O and use little
+  CPU, so they also suit data-loader workers. Turning on `readahead=True` helps
+  only when the whole store is read in file order.
 - Large arrays read in windows: write them with `chunk_rows=` and read
   `read_array_rows(key, index, start=, stop=)`; only the touched chunks are copied.
 - Compression (`write_ndarray(..., compression="zstd")`) trades CPU in the workers

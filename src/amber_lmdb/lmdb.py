@@ -224,6 +224,7 @@ def _check_array_tag(tag: str | None, info: ArrayHeader) -> None:
 
 #: Bodies and chunks at least this large are verified in the thread pool, if any.
 _PARALLEL_DIGEST_BYTES = 64 * 1024
+_PAGE_BYTES = 4096
 
 
 def _row_checks(
@@ -241,6 +242,17 @@ def _row_checks(
 def _node_budget(limit: int | None) -> _codec._NodeBudget | None:
     """Return a fresh batch node budget, or None without ``max_decoded_nodes``."""
     return None if limit is None else _codec._NodeBudget(limit)
+
+
+def _touch_body(environment: Environment, location: bytes) -> None:
+    """Read one byte of every page of a body in a short transaction of this thread."""
+    try:
+        with environment.begin(write=False, buffers=True) as transaction:
+            value = transaction.get(location)
+            if value is not None:
+                bytes(value[::_PAGE_BYTES])
+    except lmdb.Error:
+        pass
 
 
 def _plain(value: bytes | bytearray | _ArrayRows) -> bytes | bytearray:
@@ -2776,6 +2788,49 @@ class TypedReader:
             result = as_tensor(_writable(array))
         return result if dtype is None else result.to(dtype=dtype)
 
+    def read_as_tensor_many(
+        self,
+        keys: Sequence[str | Path | tuple[str, ...]],
+        *,
+        indices: Sequence[int | None] | None = None,
+        dtype: torch.dtype | None = None,
+        max_items: int = 1024,
+        max_bytes: int | None = DEFAULT_MAX_BYTES,
+    ) -> list[Tensor]:
+        """Read CPU tensors (stored tensors or plain or chunked arrays) in one transaction.
+
+        Args:
+            keys: Tensor or array keys; input order and duplicates are preserved.
+            indices: Index for each key; None means every key has no index.
+            dtype: Output dtype for every tensor; None retains the stored dtypes.
+            max_items: Item limit, 1 to 1,048,576 (2**20).
+            max_bytes: Aggregate body/integrity metadata copy budget, 64 MiB by
+                default; None removes it.
+
+        Returns:
+            Tensors in key order, as ``read_as_tensor`` returns them. Empty input
+            opens no environment. Requires PyTorch.
+        """
+        locations = self._batch_locations(keys, indices, max_items, max_bytes)
+        if not locations:
+            return []
+        owned = self._owned_entries(locations, "read_as_tensor", max_bytes=max_bytes, mutable=True)
+        tensors = []
+        for _, metadata, value in owned:
+            if metadata.writer_tag == "write_tensor":
+                result = _tensor(_plain(value))
+            else:
+                from .tensors import as_tensor
+
+                array = (
+                    value.array()
+                    if isinstance(value, _ArrayRows)
+                    else _codec.bytes_to_ndarray(value)
+                )
+                result = as_tensor(_writable(array))
+            tensors.append(result if dtype is None else result.to(dtype=dtype))
+        return tensors
+
     def read_as_shape(
         self,
         key: str | Path | tuple[str, ...],
@@ -2850,6 +2905,13 @@ class LMDBReader(TypedReader):
             workers that already use every core. The pool's threads live until
             ``close()``; close the reader before forking (spawn is preferred), though
             a forked child starts its own pool.
+        read_threads: Before a read of two or more values copies them, fetch their
+            bodies concurrently in a pool of this many threads, each in its own read
+            transaction. A cold store then waits for one round trip per batch rather
+            than per page, which on network storage without readahead makes batches
+            several times faster; the threads mostly wait on I/O, not on cores.
+            0 (default) reads in the calling thread only. The pool's lifetime
+            follows ``verify_threads``.
         generation: Read this generation (``v-<32 hex>``) instead of the one ``CURRENT``
             selects, for example to compare or roll back; it stays pinned across
             ``refresh()``.
@@ -2906,6 +2968,7 @@ class LMDBReader(TypedReader):
         verify_checksums: bool = True,
         value_limits: ValueLimits | None = None,
         verify_threads: int = 0,
+        read_threads: int = 0,
         generation: str | None = None,
         cooperative: bool = True,
     ):
@@ -2919,6 +2982,8 @@ class LMDBReader(TypedReader):
             raise TypeError("value_limits must be a ValueLimits instance or None")
         if type(verify_threads) is not int or verify_threads < 0:
             raise ValueError("verify_threads must be a nonnegative integer")
+        if type(read_threads) is not int or read_threads < 0:
+            raise ValueError("read_threads must be a nonnegative integer")
         if generation is not None and (
             type(generation) is not str or not _is_version_name(generation)
         ):
@@ -2931,6 +2996,7 @@ class LMDBReader(TypedReader):
         self._verify_checksums = verify_checksums
         self._value_limits = value_limits
         self._verify_threads = verify_threads
+        self._read_threads = read_threads
         self._generation = generation  # explicit: kept across refresh()
         self._pinned: str | None = None  # carried over by pickling
         self._cooperative = cooperative
@@ -2938,6 +3004,7 @@ class LMDBReader(TypedReader):
         self._lock = _threading.RLock()
         self._finalizer: weakref.finalize[Any, Any] | None = None
         self._pool: ThreadPoolExecutor | None = None
+        self._read_pool: ThreadPoolExecutor | None = None
         self._env: Environment | None = None
         self._env_key: _EnvKey | None = None
         self._metadata_db: Any = None
@@ -2990,6 +3057,11 @@ class LMDBReader(TypedReader):
         """Return the digest verification thread count; 0 verifies in the calling thread."""
         return self._verify_threads
 
+    @property
+    def read_threads(self) -> int:
+        """Return the body fetch thread count; 0 reads in the calling thread only."""
+        return self._read_threads
+
     def __repr__(self) -> str:
         state = "closed" if self._closed else ("open" if self._env is not None else "unopened")
         return f"LMDBReader({str(self._path)!r}, generation={self.generation!r}, {state})"
@@ -3031,6 +3103,23 @@ class LMDBReader(TypedReader):
             for future in futures.values():
                 future.cancel()
 
+    def _fetch(self, environment: Environment, locations: Sequence[bytes]) -> None:
+        """Bring the bodies of ``locations`` into the page cache from several threads.
+
+        Only a warm-up: the caller reads and checks the values afterwards in its own
+        transaction, so errors here are left for that read to report.
+        """
+        if not self._read_threads or len(locations) < 2:
+            return
+        if self._read_pool is None:
+            with self._lock:
+                if self._read_pool is None:
+                    self._read_pool = ThreadPoolExecutor(
+                        max_workers=self._read_threads, thread_name_prefix="amber-lmdb-read"
+                    )
+        for _ in self._read_pool.map(functools.partial(_touch_body, environment), locations):
+            pass
+
     def _get_env(self) -> Environment:
         """Lazily acquire the reader environment and open its writer-tag database.
 
@@ -3056,6 +3145,7 @@ class LMDBReader(TypedReader):
                 self._env_key = None
                 self._metadata_db = None
                 self._pool = None  # An inherited pool has no threads in this process.
+                self._read_pool = None
                 self._pid = os.getpid()
             if self._env is None:
                 key = _environment_key(
@@ -3101,7 +3191,9 @@ class LMDBReader(TypedReader):
         views: list[tuple[bytes, EntryMetadata, bytes | memoryview | _ArrayRows]] = []
         used = 0
         has_rows = False
-        with self._get_env().begin(write=False, buffers=True) as transaction:
+        environment = self._get_env()
+        self._fetch(environment, locations)
+        with environment.begin(write=False, buffers=True) as transaction:
             if snapshot is not None:
                 self._check_snapshot(transaction, snapshot, "owned read pages")
             for location in locations:
@@ -3675,9 +3767,10 @@ class LMDBReader(TypedReader):
 
     def _release(self) -> None:
         """Shut down the verification pool and release the environment reference."""
-        pool, self._pool = self._pool, None
-        if pool is not None and self._pid == os.getpid():
-            pool.shutdown(wait=True)
+        for pool in (self._pool, self._read_pool):
+            if pool is not None and self._pid == os.getpid():
+                pool.shutdown(wait=True)
+        self._pool = self._read_pool = None
         finalizer = self._finalizer
         key = self._env_key
         # Detach first; only the process that acquired the reference releases it.
@@ -3720,6 +3813,7 @@ class LMDBReader(TypedReader):
         state["_env_key"] = None
         state["_metadata_db"] = None
         state["_pool"] = None
+        state["_read_pool"] = None
         state["_finalizer"] = None
         state["_lock"] = None
         state["_pid"] = os.getpid()

@@ -136,13 +136,14 @@ while a writer or a cleanup may touch the store.
 | Bound a single read | `read(..., max_bytes=)` and every `read_as_*` | Refused before copying when the body is larger |
 | Inspect array shapes/dtypes | `read_array_headers_many` | No body copies; repeated headers share parsing within a call |
 | Read row windows of large arrays | `read_array_rows`, `read_array_rows_many`; `write_ndarray(..., chunk_rows=)` | Chunked arrays copy and verify only touched chunks |
-| Feed PyTorch | `read_as_tensor` (tensors and arrays), `as_tensor` | Writable tensors without the read-only warning |
+| Feed PyTorch | `read_as_tensor`, `read_as_tensor_many` (tensors and arrays), `as_tensor` | Writable tensors without the read-only warning |
 | Construct indexed records | `RecordTable` | A sequence of rows `0..count-1`; optional factory and schema |
 | Check mapping fields | `ValueSchema`, `RecordSchema` | Exact types or explicit shape/dtype/range/optional rules; no coercion |
 | Share a derived result | `DerivedIndexCache.get_or_build`, `lookup` | Caller identity/codec; `CacheResult.hit` distinguishes a stored `None` |
 | Keep a cache directory bounded | `DerivedIndexCache.prune`; CLI `cache-list`, `cache-prune` | Dry run by default; busy entries kept |
 | Bound decoding of untrusted values | `LMDBReader(..., value_limits=ValueLimits(...))`, `max_decoded_nodes=` | Lowers MessagePack limits only; arrays unaffected |
 | Verify large batches on idle cores | `LMDBReader(..., verify_threads=N)` | Bodies and chunks of at least 64 KiB; off by default |
+| Read cold batches from network storage | `LMDBReader(..., read_threads=N)` | Fetches the bodies of a batch concurrently; off by default |
 | Check, count or list keys | `contains`, `count`, `index_range`, `iter_indices`, `iter_keys` | Integrity metadata only; listing costs one seek per logical key |
 | Read several stores as one | `LMDBOverlayReader` | Nothing copied; an entry in more than one layer raises `OverlayConflictError` |
 | Manage generations | `inspect_generations`, `set_current`, `prune_generations`, `delete_generations`, `read_history` | Deletion is explicit, cooperative and same-host |

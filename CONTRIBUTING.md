@@ -72,7 +72,10 @@ and process isolation are different stops; none may publish partial output.
 raise rather than truncate. The typed-value decoder must keep the previous
 implementation's results and error messages; `tests/test_value_limits.py` compares
 them on valid and mutated nodes. Threaded digest verification must report the first
-corrupt entry in request order, like sequential verification. Progress callbacks run between pages, outside transactions, and a
+corrupt entry in request order, like sequential verification. Threaded body fetches
+(`read_threads`) only warm the page cache: each runs in its own short read transaction,
+ignores its own errors and never supplies a value, so results and error reports stay
+those of the calling thread's read. Progress callbacks run between pages, outside transactions, and a
 cancelled report must never be `ok`. Tensor bodies are copied once into a private
 bytearray that the returned tensor owns; never let a tensor alias LMDB memory or a
 caller's buffer. The same holds for arrays read with `writable=True` and for

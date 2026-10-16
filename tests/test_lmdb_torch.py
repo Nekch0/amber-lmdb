@@ -126,3 +126,24 @@ def test_generic_write_and_bounded_read_return_original_types(ds_path, value):
             np.testing.assert_array_equal(restored, value)
         else:
             assert restored == value
+
+
+def test_read_as_tensor_many_matches_single_reads(ds_path):
+    with LMDBWriter(ds_path, map_size=16 * 1024**2) as writer:
+        for index in range(3):
+            writer.write_tensor(torch.full((2, 3), float(index)), key="hidden", index=index)
+        writer.write_ndarray(np.arange(4, dtype=np.int32), key="array")
+        writer.commit()
+    keys = ["hidden", "array", "hidden", "hidden"]
+    indices = [2, None, 0, 2]
+    with LMDBReader(ds_path, read_threads=2) as reader:
+        tensors = reader.read_as_tensor_many(keys, indices=indices)
+        singles = [reader.read_as_tensor(k, index=i) for k, i in zip(keys, indices, strict=True)]
+        halves = reader.read_as_tensor_many(keys[:1], indices=[1], dtype=torch.float16)
+        assert reader.read_as_tensor_many([]) == []
+    for tensor, single in zip(tensors, singles, strict=True):
+        assert torch.equal(tensor, single)
+    assert tensors[0] is not tensors[3]
+    tensors[0].add_(1)  # Every result owns writable memory.
+    assert torch.equal(tensors[3], torch.full((2, 3), 2.0))
+    assert halves[0].dtype == torch.float16
