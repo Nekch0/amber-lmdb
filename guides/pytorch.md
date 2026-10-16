@@ -112,14 +112,21 @@ take up to 1024 keys by default; raise `max_items` (up to 2**20) and `max_bytes`
 - Keep `verify_threads=0` (the default) in worker readers; workers already use the
   cores. Verifying digests can be skipped with `verify_checksums=False` only for
   stores whose operator vouches that they are intact.
+- Writers record where each indexed body of at least 8 KiB lies in the file, and
+  readers use it (`prefetch=True`, the default) to ask the kernel for whole bodies
+  before copying them. On a 1 GbE NFS mount with 128 KiB readahead, single bodies of
+  about 155 KB read at random rose from about 16 to about 90 per second. Stores
+  written by earlier versions read as before; rewriting them records the locations.
 - On network storage (NFS) a cold read waits for every page in turn. Read a batch
   with `read_as_ndarray_many` or `read_as_tensor_many` and give the reader
   `read_threads=8` (or more): the bodies are fetched concurrently before they are
   copied. On a 1 GbE NFS mount, reading 26 values of about 155 KB at a time rose
   from 14 MB/s to 54 MB/s with eight threads and 74 MB/s with 26; four processes
-  together rose from 50 MB/s to 82 MB/s. The threads wait on I/O and use little
-  CPU, so they also suit data-loader workers. Turning on `readahead=True` helps
-  only when the whole store is read in file order.
+  together rose from 50 MB/s to 82 MB/s on stores without recorded locations. On a
+  store whose bodies are prefetched and laid out so that a batch is contiguous,
+  four processes reading together were faster without threads (26 MB/s against
+  15 MB/s in total), so leave `read_threads=0` when several processes read at once.
+  Turning on `readahead=True` helps only when the whole store is read in file order.
 - Large arrays read in windows: write them with `chunk_rows=` and read
   `read_array_rows(key, index, start=, stop=)`; only the touched chunks are copied.
 - Compression (`write_ndarray(..., compression="zstd")`) trades CPU in the workers

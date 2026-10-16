@@ -26,6 +26,7 @@ from .lmdb import (
     _chunk_location,
     _chunk_parent,
     _is_metadata_descriptor,
+    _is_reserved,
     _opened_store,
 )
 from .progress import CancelEvent, ProgressCallback, _Tracker
@@ -285,7 +286,7 @@ def array_statistics(
                 entry = _entry_info(raw.location, raw.header, raw.size, raw.tag)
                 if entry.error is not None:
                     raise ValueError(f"invalid entry {raw.location.hex()}: {entry.error}")
-                if entry.writer_tag not in _ARRAY_KINDS:
+                if entry.writer_tag not in _ARRAY_KINDS or _is_reserved(raw.location):
                     continue
                 header = parse_array_header(raw.header, stored_bytes=raw.size)
                 arrays += 1

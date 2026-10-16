@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import logging
 import math
@@ -29,6 +30,7 @@ from frozendict import frozendict
 from lmdb import Environment, Transaction
 from numpy.typing import NDArray
 
+from . import _locations
 from . import chunks as _chunks
 from . import codec as _codec
 from ._ownership import _FileLock, _generation_lock, _root_gate
@@ -655,6 +657,10 @@ class LMDBWriter:
         # Writes and deletes look for chunked arrays to replace only once a chunked
         # array was written or copied from a base, so plain writers pay nothing.
         self._may_hold_chunks = base is not None
+        # Large indexed bodies written in the open transaction, and the file locations
+        # recorded after each commit (see _locations); published as location tables.
+        self._unrecorded: list[bytes] = []
+        self._recorded: dict[bytes, list[NDArray[np.uint64]]] = {}
 
     @property
     def path(self) -> Path:
@@ -733,6 +739,8 @@ class LMDBWriter:
         transaction = self._get_txn()
         ok = transaction.put(loc, value)
         transaction.put(loc, metadata, db=self._metadata_db)
+        if len(value) >= _locations.MIN_BYTES and not _is_reserved(loc):
+            self._unrecorded.append(loc)
         return ok, metadata
 
     def _drop_chunks(self, location: bytes) -> None:
@@ -1140,6 +1148,57 @@ class LMDBWriter:
         if self._txn is not None:
             self._txn.commit()
             self._txn = None
+            self._record_locations()
+
+    def _record_locations(self) -> None:
+        """Record where the bodies committed since the last call lie in ``data.mdb``.
+
+        The bodies were just written, so reading them back through the map normally
+        hits the page cache. Locations are only hints for readers (see _locations).
+        """
+        pending, self._unrecorded = self._unrecorded, []
+        if not pending or self._env is None:
+            return
+        info = self._env.info()
+        base, limit = int(info["map_addr"]), int(info["map_size"])
+        rows: dict[bytes, list[tuple[int, int, int]]] = {}
+        with self._env.begin(write=False, buffers=True) as transaction:
+            for location in pending:
+                group = _locations.group_of(location)
+                if group is None:
+                    continue
+                value = transaction.get(location)
+                if value is None:
+                    continue
+                offset = _locations.body_offset(value, base)
+                if 0 <= offset < limit:
+                    rows.setdefault(group[0], []).append((group[1], offset, len(value)))
+        for prefix, entries in rows.items():
+            self._recorded.setdefault(prefix, []).append(np.array(entries, dtype=np.uint64))
+
+    def _write_locations(self) -> None:
+        """Store one location table per logical key and commit them."""
+        recorded, self._recorded = self._recorded, {}
+        for prefix, parts in sorted(recorded.items()):
+            table = _locations.merge_tables(parts)
+            self._put_tagged(
+                _locations.table_location(prefix),
+                _codec.dict_to_bytes(_locations.encode_table(table)),
+                "write_dict",
+                reserved=True,
+            )
+        self.commit()
+
+    def _drop_location_tables(self) -> None:
+        """Remove location tables copied from a base: a compact copy moves bodies."""
+        transaction = self._get_txn()
+        prefix = _locations._TABLE_PREFIX
+        for database in (self._metadata_db, None):
+            with transaction.cursor(db=database) as cursor:
+                cursor.set_range(prefix)
+                while bytes(cursor.key()).startswith(prefix):
+                    if not cursor.delete():
+                        break
 
     def _acquire_lock(self) -> None:
         """Acquire the neighboring writer lock without waiting.
@@ -1412,6 +1471,7 @@ class LMDBWriter:
         manifest = get_loc(_MANIFEST_KEY)
         transaction.delete(manifest, db=self._metadata_db)
         transaction.delete(manifest)
+        self._drop_location_tables()
         self.commit()
 
     def _close_staging_env(self) -> None:
@@ -1437,11 +1497,15 @@ class LMDBWriter:
                     # documented way to finish, so it is not worth a warning.
                     _log.debug("committing the remaining writes on context exit")
                     self._txn.commit()
+                    self._txn = None
+                    self._record_locations()
                 else:
                     self._txn.abort()
                 self._txn = None
             if exc_type is None and self._env is None:
                 self._get_env()
+            if exc_type is None and self._recorded:
+                self._write_locations()
             if exc_type is None and self._manifest:
                 from .manifest import _write_manifest
 
@@ -2905,6 +2969,11 @@ class LMDBReader(TypedReader):
             workers that already use every core. The pool's threads live until
             ``close()``; close the reader before forking (spawn is preferred), though
             a forked child starts its own pool.
+        prefetch: Before copying bodies, ask the kernel for each whole body at once
+            (``posix_fadvise``), using the body locations a writer recorded. A cold
+            read on network storage then waits for one round trip per body instead
+            of one per page. Stores written before this version, bodies under 8 KiB
+            and systems without ``posix_fadvise`` read as without it.
         read_threads: Before a read of two or more values copies them, fetch their
             bodies concurrently in a pool of this many threads, each in its own read
             transaction. A cold store then waits for one round trip per batch rather
@@ -2969,6 +3038,7 @@ class LMDBReader(TypedReader):
         value_limits: ValueLimits | None = None,
         verify_threads: int = 0,
         read_threads: int = 0,
+        prefetch: bool = True,
         generation: str | None = None,
         cooperative: bool = True,
     ):
@@ -2984,6 +3054,8 @@ class LMDBReader(TypedReader):
             raise ValueError("verify_threads must be a nonnegative integer")
         if type(read_threads) is not int or read_threads < 0:
             raise ValueError("read_threads must be a nonnegative integer")
+        if type(prefetch) is not bool:
+            raise TypeError("prefetch must be bool")
         if generation is not None and (
             type(generation) is not str or not _is_version_name(generation)
         ):
@@ -2997,6 +3069,9 @@ class LMDBReader(TypedReader):
         self._value_limits = value_limits
         self._verify_threads = verify_threads
         self._read_threads = read_threads
+        self._prefetch = prefetch
+        self._location_tables: dict[bytes, NDArray[np.uint64] | None] = {}
+        self._data_descriptor: int | None = None
         self._generation = generation  # explicit: kept across refresh()
         self._pinned: str | None = None  # carried over by pickling
         self._cooperative = cooperative
@@ -3058,6 +3133,11 @@ class LMDBReader(TypedReader):
         return self._verify_threads
 
     @property
+    def prefetch(self) -> bool:
+        """Return whether reads prefetch whole bodies from recorded locations."""
+        return self._prefetch
+
+    @property
     def read_threads(self) -> int:
         """Return the body fetch thread count; 0 reads in the calling thread only."""
         return self._read_threads
@@ -3103,6 +3183,49 @@ class LMDBReader(TypedReader):
             for future in futures.values():
                 future.cancel()
 
+    def _prefetch_bodies(self, environment: Environment, locations: Sequence[bytes]) -> None:
+        """Ask the kernel for the recorded bodies of ``locations`` before they are read."""
+        if not self._prefetch or _locations.FADVISE is None:
+            return
+        spans: list[tuple[int, int]] = []
+        for location in locations:
+            group = _locations.group_of(location)
+            if group is None:
+                continue
+            table = self._location_table(environment, group[0])
+            if table is not None:
+                span = _locations.lookup(table, group[1])
+                if span is not None:
+                    spans.append(span)
+        if spans:
+            descriptor = self._data_file()
+            if descriptor is not None:
+                _locations.advise(descriptor, spans)
+
+    def _location_table(self, environment: Environment, prefix: bytes) -> NDArray[np.uint64] | None:
+        """Load and cache the location table of one logical key; None if absent."""
+        if prefix in self._location_tables:
+            return self._location_tables[prefix]
+        table = None
+        with environment.begin(write=False, buffers=True) as transaction:
+            raw = transaction.get(_locations.table_location(prefix))
+            if raw is not None:
+                try:
+                    table = _locations.decode_table(_codec.bytes_to_dict(bytes(raw)))
+                except (TypeError, ValueError):
+                    table = None
+        self._location_tables[prefix] = table
+        return table
+
+    def _data_file(self) -> int | None:
+        """Open (once per process) the opened generation's ``data.mdb`` for advice."""
+        if self._data_descriptor is None and self._env_key is not None:
+            try:
+                self._data_descriptor = os.open(Path(self._env_key[1]) / "data.mdb", os.O_RDONLY)
+            except OSError:
+                self._prefetch = False
+        return self._data_descriptor
+
     def _fetch(self, environment: Environment, locations: Sequence[bytes]) -> None:
         """Bring the bodies of ``locations`` into the page cache from several threads.
 
@@ -3146,6 +3269,8 @@ class LMDBReader(TypedReader):
                 self._metadata_db = None
                 self._pool = None  # An inherited pool has no threads in this process.
                 self._read_pool = None
+                self._data_descriptor = None  # The parent's descriptor is not ours.
+                self._location_tables = {}
                 self._pid = os.getpid()
             if self._env is None:
                 key = _environment_key(
@@ -3192,6 +3317,7 @@ class LMDBReader(TypedReader):
         used = 0
         has_rows = False
         environment = self._get_env()
+        self._prefetch_bodies(environment, locations)
         self._fetch(environment, locations)
         with environment.begin(write=False, buffers=True) as transaction:
             if snapshot is not None:
@@ -3771,6 +3897,11 @@ class LMDBReader(TypedReader):
             if pool is not None and self._pid == os.getpid():
                 pool.shutdown(wait=True)
         self._pool = self._read_pool = None
+        descriptor, self._data_descriptor = self._data_descriptor, None
+        if descriptor is not None and self._pid == os.getpid():
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+        self._location_tables = {}
         finalizer = self._finalizer
         key = self._env_key
         # Detach first; only the process that acquired the reference releases it.
@@ -3814,6 +3945,8 @@ class LMDBReader(TypedReader):
         state["_metadata_db"] = None
         state["_pool"] = None
         state["_read_pool"] = None
+        state["_data_descriptor"] = None
+        state["_location_tables"] = {}
         state["_finalizer"] = None
         state["_lock"] = None
         state["_pid"] = os.getpid()

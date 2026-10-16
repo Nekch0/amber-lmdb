@@ -75,7 +75,11 @@ them on valid and mutated nodes. Threaded digest verification must report the fi
 corrupt entry in request order, like sequential verification. Threaded body fetches
 (`read_threads`) only warm the page cache: each runs in its own short read transaction,
 ignores its own errors and never supplies a value, so results and error reports stay
-those of the calling thread's read. Progress callbacks run between pages, outside transactions, and a
+those of the calling thread's read. Body location tables
+(`("amber-lmdb", "locations", ...)`) are hints in the same way: a reader only passes
+them to `posix_fadvise`, so a missing, stale or damaged table may cost speed but must
+never change a value or an error. Writers drop tables copied from a base, because a
+compact copy moves the bodies. Progress callbacks run between pages, outside transactions, and a
 cancelled report must never be `ok`. Tensor bodies are copied once into a private
 bytearray that the returned tensor owns; never let a tensor alias LMDB memory or a
 caller's buffer. The same holds for arrays read with `writable=True` and for

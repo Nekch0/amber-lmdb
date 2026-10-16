@@ -143,6 +143,7 @@ while a writer or a cleanup may touch the store.
 | Keep a cache directory bounded | `DerivedIndexCache.prune`; CLI `cache-list`, `cache-prune` | Dry run by default; busy entries kept |
 | Bound decoding of untrusted values | `LMDBReader(..., value_limits=ValueLimits(...))`, `max_decoded_nodes=` | Lowers MessagePack limits only; arrays unaffected |
 | Verify large batches on idle cores | `LMDBReader(..., verify_threads=N)` | Bodies and chunks of at least 64 KiB; off by default |
+| Read cold bodies from network storage | `LMDBReader(..., prefetch=True)` (default) | Writers record where large bodies lie; reads ask the kernel for whole bodies at once |
 | Read cold batches from network storage | `LMDBReader(..., read_threads=N)` | Fetches the bodies of a batch concurrently; off by default |
 | Check, count or list keys | `contains`, `count`, `index_range`, `iter_indices`, `iter_keys` | Integrity metadata only; listing costs one seek per logical key |
 | Read several stores as one | `LMDBOverlayReader` | Nothing copied; an entry in more than one layer raises `OverlayConflictError` |
