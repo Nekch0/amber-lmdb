@@ -18,12 +18,15 @@ missing, stale or damaged table can cost speed but never change a result.
 
 from __future__ import annotations
 
+import contextlib
 import os
 from collections.abc import Callable, Iterable
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
 
+from . import codec as _codec
 from .keys import decode_key, get_loc
 
 RESERVED_COMPONENT = "amber-lmdb"  # The same reserved namespace as amber_lmdb.lmdb.
@@ -35,6 +38,8 @@ PIECE = 1024 * 1024
 
 GAP = 64 * 1024
 """Neighboring bodies closer than this are requested as one range."""
+
+_NO_TABLE = 2**64  # Larger than any index: skip the rest of a key without a table.
 
 _TABLE_PREFIX = get_loc((RESERVED_COMPONENT, "locations", ""))[:-9]
 """Encoded prefix shared by every location table key (third component excluded)."""
@@ -131,3 +136,78 @@ def _advise_range(descriptor: int, start: int, end: int) -> None:
             FADVISE(descriptor, piece, min(PIECE, end - piece), WILLNEED)
         except OSError:
             return
+
+
+class ScanPrefetcher:
+    """Prefetch the bodies that a scan in key order is about to read.
+
+    A scan reads the indices of one logical key in order, which is the order of its
+    location table. When the scan reaches an index past what was already
+    requested, the next bodies of that key, up to ``budget`` bytes, are requested
+    at once. Keys without a table are scanned as before.
+
+    Args:
+        generation: Directory of the generation being scanned.
+        budget: Bytes requested ahead of the scan for one logical key.
+    """
+
+    def __init__(self, generation: str, budget: int = 64 * 1024 * 1024) -> None:
+        self._data = os.path.join(generation, "data.mdb")
+        self._budget = budget
+        self._descriptor: int | None = None
+        self._disabled = FADVISE is None
+        self._prefix = b""
+        self._until = -1
+
+    def before(self, transaction: Any, location: bytes) -> None:
+        """Call with a location before its body is read, inside the scan's transaction."""
+        if self._disabled:
+            return
+        prefix = self._prefix
+        if (
+            len(location) == len(prefix) + 9
+            and location[-9] == 1
+            and location.startswith(prefix)
+            and int.from_bytes(location[-8:], "big") <= self._until
+        ):
+            return
+        group = group_of(location)
+        if group is None:
+            return
+        prefix, index = group
+        self._prefix, self._until = prefix, _NO_TABLE
+        raw = transaction.get(table_location(prefix))
+        if raw is None:
+            return
+        try:
+            table = decode_table(_codec.bytes_to_dict(bytes(raw)))
+        except (TypeError, ValueError):
+            table = None
+        if table is None:
+            return
+        first = int(np.searchsorted(table[:, 0], index))
+        if first >= table.shape[0]:
+            return
+        lengths = np.cumsum(table[first:, 2])
+        count = max(1, int(np.searchsorted(lengths, self._budget, side="right")))
+        rows = table[first : first + count]
+        descriptor = self._open()
+        if descriptor is None:
+            return
+        advise(descriptor, ((int(o), int(n)) for o, n in rows[:, 1:]))
+        self._until = int(rows[-1, 0])
+
+    def _open(self) -> int | None:
+        if self._descriptor is None:
+            try:
+                self._descriptor = os.open(self._data, os.O_RDONLY)
+            except OSError:
+                self._disabled = True
+        return self._descriptor
+
+    def close(self) -> None:
+        """Close the data file."""
+        descriptor, self._descriptor = self._descriptor, None
+        if descriptor is not None:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)

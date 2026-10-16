@@ -1,6 +1,7 @@
 """Writers record body locations; readers prefetch whole bodies from them."""
 
 import pickle
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -161,3 +162,46 @@ def test_prefetch_must_be_bool(tmp_path):
 
 def test_reserved_component_matches_the_store_namespace():
     assert _locations.RESERVED_COMPONENT == storage._RESERVED_COMPONENT
+
+
+def test_verify_store_prefetches_ahead_of_the_scan(tmp_path, monkeypatch):
+    path = tmp_path / "store.lmdb"
+    _write(path)
+    calls = _record_advice(monkeypatch)
+    report = verify_store(path)
+    assert report.ok
+    with LMDBReader(path) as reader:
+        tables = [_table(reader, ("s", "tensor", name)) for name in ("a", "b")]
+
+    def covered(position):
+        return any(offset <= position < offset + length for offset, length, _ in calls)
+
+    for table in tables:
+        for _, offset, length in table.tolist():
+            assert covered(offset) and covered(offset + length - 1)
+
+
+def test_scan_prefetch_stops_at_the_budget(tmp_path, monkeypatch):
+    path = tmp_path / "store.lmdb"
+    _write(path)
+    calls = _record_advice(monkeypatch)
+    with LMDBReader(path) as reader:
+        environment = reader._get_env()
+        generation = str(Path(reader._env_key[1]))
+        prefetcher = _locations.ScanPrefetcher(generation, budget=2 * LARGE + 1000)
+        with environment.begin(buffers=True) as transaction:
+            prefetcher.before(transaction, get_loc(("s", "tensor", "a"), 1))
+            first = len(calls)
+            # Indices 1 and 2 were requested together; index 2 needs nothing new.
+            prefetcher.before(transaction, get_loc(("s", "tensor", "a"), 2))
+            assert len(calls) == first
+            prefetcher.before(transaction, get_loc(("s", "tensor", "a"), 3))
+            assert len(calls) > first
+            # A key without a table, and an unindexed key, request nothing.
+            count = len(calls)
+            prefetcher.before(transaction, get_loc(("s", "small"), 0))
+            prefetcher.before(transaction, get_loc("unindexed"))
+            assert len(calls) == count
+        prefetcher.close()
+        offset = int(_table(reader, ("s", "tensor", "a"))[3, 1])
+    assert any(o <= offset < o + n for o, n, _ in calls[first:])

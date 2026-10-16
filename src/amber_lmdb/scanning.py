@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterator
-from contextlib import contextmanager, suppress
+from contextlib import closing, contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 import lmdb
 
+from . import _locations
 from .arrays import _header_view, parse_array_header
 from .budgets import DEFAULT_MAX_BYTES, ReadLimitError
 from .chunks import CHUNK_TAG, CHUNKED_TAG, _chunked_info, _layout
@@ -178,6 +179,7 @@ def _pages(
     max_batch_bytes: int,
     max_value_bytes: int,
     with_payload: bool,
+    prefetcher: _locations.ScanPrefetcher | None = None,
 ) -> Iterator[list[_RawEntry]]:
     after: bytes | None = None
     while True:
@@ -193,6 +195,8 @@ def _pages(
                 while found and len(page) < batch_size:
                     location = bytes(cursor.key())
                     if not _is_metadata_descriptor(location):
+                        if prefetcher is not None:
+                            prefetcher.before(transaction, location)
                         value = cursor.value()
                         raw_tag = None if tags is None else transaction.get(location, db=tags)
                         tag_size = (
@@ -477,7 +481,10 @@ def verify_store(
     def partial() -> ValidationReport:
         return report(cancelled=True)
 
-    with _opened(path, generation=generation, cooperative=cooperative) as (env, tags, snapshot):
+    with (
+        _opened(path, generation=generation, cooperative=cooperative) as (env, tags, snapshot),
+        closing(_locations.ScanPrefetcher(snapshot.generation)) as prefetcher,
+    ):
         tracker = _Tracker("verify_store", progress, cancel, total=_entry_total(env, tags))
         tracker.check(partial)
         if tags is None:
@@ -490,6 +497,7 @@ def verify_store(
             max_batch_bytes=max_batch_bytes,
             max_value_bytes=max_value_bytes,
             with_payload=True,
+            prefetcher=prefetcher,
         ):
             headers: list[tuple[bytes, bytes]] = []
             chunks: list[tuple[bytes, EntryMetadata]] = []
